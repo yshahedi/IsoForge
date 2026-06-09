@@ -1,6 +1,8 @@
 
 #include "processor.h"
 #include <format>
+#include <charconv>
+#include <cstdint>
 
 using asio::ip::tcp;
 
@@ -10,10 +12,11 @@ namespace YSH
     // ClientSession
     // -------------------------
 
-    ClientSession::ClientSession(asio::io_context &io_context, asio::thread_pool &worker_pool, std::shared_ptr<Config> config)
-        : socket_(io_context), io_context_(io_context), worker_pool_(worker_pool), config_(config), timer_(io_context), resolver_(io_context)
+    ClientSession::ClientSession(asio::io_context &io_context, std::shared_ptr<Config> config)
+        : socket_(io_context), io_context_(io_context), config_(config), strand_(asio::make_strand(socket_.get_executor()))
     {
-        DL_ISO8583_DEFS_1993_GetHandler(&iso_handler_);
+        iso_handler_ = std::make_shared<DL_ISO8583_HANDLER>();
+        DL_ISO8583_DEFS_1993_GetHandler(iso_handler_.get());        
     }
 
     ClientSession::~ClientSession()
@@ -22,60 +25,59 @@ namespace YSH
 
     void ClientSession::start()
     {
+        tcp::resolver resolver(io_context_);
+        auto endpoints = resolver.resolve(config_->host, std::to_string(config_->port));
+        do_connect(endpoints);
     }
 
-    void ClientSession::send_async(std::unique_ptr<IsoMsg> request)
+    void ClientSession::send(std::unique_ptr<IsoMsg> request)
     {
-        DL_UINT16 packedSize;
-        (void)DL_ISO8583_MSG_Pack(&iso_handler_, request->get(), body_, &packedSize);
-        body_len_ = packedSize;
-
         auto self = shared_from_this();
-        set_timeout(std::chrono::milliseconds(config_->timeout));
-        /* auto endpoints = resolver_.resolve(config_->host,config_->port);
-         self->do_connect(endpoints);*/
+        DL_UINT16 length;
+        uint8_t body[MAX_LEN];
+        (void)DL_ISO8583_MSG_Pack(request->getHandler(), request->get(), body, &length);
 
-        resolver_.async_resolve(
-            config_->host,
-            std::to_string(config_->port),
-            [self](const asio::error_code &ec,
-                   tcp::resolver::results_type endpoints)
-            {
-                if (ec)
-                {
-                    self->finish(ec, nullptr);
-                    return;
-                }
+        auto state = std::make_shared<MessageTaskState>();
 
-                self->do_connect(endpoints);
+        state->timer = std::make_shared<asio::steady_timer>(io_context_, std::chrono::milliseconds(config_->timeout));
+
+        state->timer->async_wait([state, self, body, length](const std::error_code &ec)
+                                 {
+        if (!ec && !state->is_completed) {
+            state->is_timed_out = true;
+            auto iso_timeout_msg=std::make_unique<IsoMsg>(self->iso_handler_);       
+
+            (void)DL_ISO8583_MSG_Unpack(iso_timeout_msg->getHandler(), body, length, iso_timeout_msg->get());
+            if(self->config_->timeout_processor) iso_timeout_msg = self->config_->timeout_processor(std::move(iso_timeout_msg));
+
+            asio::post(self->strand_, [self , iso_timeout_msg = std::move(iso_timeout_msg)]() mutable
+            { 
+                self->finish({}, std::move(iso_timeout_msg)); 
             });
+        } });
+        auto stan =getStan(request->get());
+        
+        message_state_->emplace(stan, state);
+
+        do_write(body, length);
     }
 
     void ClientSession::finish(asio::error_code ec, std::unique_ptr<IsoMsg> response)
     {
-        if (finished_)
-        {
-            return;
-        }
+     /*   asio::error_code ignored;
 
-        finished_ = true;
-
-        asio::error_code ignored;
-
-        timer_.cancel(ignored);
         socket_.cancel(ignored);
         socket_.close(ignored);
-
+*/
         if (config_->handler)
         {
-            config_->handler(ec, iso_handler_, std::move(response));
+            config_->handler(ec, std::move(response));
         }
     }
 
     void ClientSession::do_connect(const tcp::resolver::results_type &endpoints)
     {
         auto self = shared_from_this();
-
         asio::async_connect(
             socket_,
             endpoints,
@@ -86,23 +88,21 @@ namespace YSH
                     self->finish(ec, nullptr);
                     return;
                 }
-
-                self->do_write();
+                self->read_header();
             });
     }
 
-    void ClientSession::do_write()
+    void ClientSession::do_write(const uint8_t *data, size_t len)
     {
 
         auto self = shared_from_this();
-        auto len = body_len_;
         uint8_t hdr[2];
         hdr[0] = static_cast<uint8_t>((len >> 8) & 0xFF);
         hdr[1] = static_cast<uint8_t>(len & 0xFF);
 
         std::array<asio::const_buffer, 2> buffers = {
             asio::buffer(hdr, 2),
-            asio::buffer(body_, len)};
+            asio::buffer(data, len)};
         asio::async_write(socket_, buffers,
                           [this, self, len](std::error_code ec, std::size_t)
                           {
@@ -111,8 +111,6 @@ namespace YSH
                                   self->finish(ec, nullptr);
                                   return;
                               }
-
-                              self->read_header();
                           });
     }
 
@@ -151,39 +149,28 @@ namespace YSH
                              }
                              else
                              {
-                                 auto iso_msg = std::make_unique<IsoMsg>();
-                                 (void)DL_ISO8583_MSG_Unpack(&iso_handler_, body_, body_len_, iso_msg->get());
+                                 auto iso_msg = std::make_unique<IsoMsg>(iso_handler_);
+                                 (void)DL_ISO8583_MSG_Unpack(iso_msg->getHandler(), body_, length, iso_msg->get());
+                                 auto stan = getStan(iso_msg->get());
+                                 auto it = message_state_->find(stan);
+                                 if (it == message_state_->end())
+                                 {
+                                     self->read_header();
+                                     return;
+                                 }
+                                 if (it->second->is_timed_out)
+                                 {
+                                     message_state_->erase(it);
+                                     self->read_header();
+                                     return;
+                                 }
+                                 it->second->timer->cancel();
+                                 it->second->is_completed = true;
+                                 message_state_->erase(it);
                                  self->finish({}, std::move(iso_msg));
                              }
+                             self->read_header();
                          });
-    }
-
-    void ClientSession::set_timeout(std::chrono::milliseconds dur)
-    {
-        timeout_flg_ = false;
-        timer_.expires_after(dur);
-        timer_.async_wait([this, self = shared_from_this()](asio::error_code ec)
-                          {
-            
-            std::lock_guard<std::mutex> lock(mtx_);
-            if(timeout_flg_) return;
-            timeout_flg_=true;
-            if (!ec) 
-            {
-                auto iso_timeout_msg = std::make_unique<IsoMsg>();
-                self->finish(
-                    asio::error::make_error_code(asio::error::timed_out),
-                    std::move(iso_timeout_msg)
-                );
-
-            } 
-            else
-            {
-                self->finish(
-                    ec,
-                    nullptr
-                );
-            } });
     }
 
     // -------------------------
@@ -191,9 +178,11 @@ namespace YSH
     // -------------------------
 
     Session::Session(tcp::socket socket, asio::io_context &io_context, asio::thread_pool &worker_pool, std::shared_ptr<Config> config)
-        : socket_(std::move(socket)), io_context_(io_context), worker_pool_(worker_pool), config_(config), timer_(socket_.get_executor())
+        : socket_(std::move(socket)), io_context_(io_context), worker_pool_(worker_pool), config_(config),
+          strand_(asio::make_strand(socket_.get_executor()))
     {
-        DL_ISO8583_DEFS_1993_GetHandler(&iso_handler_);
+        iso_handler_ = std::make_shared<DL_ISO8583_HANDLER>();
+        DL_ISO8583_DEFS_1993_GetHandler(iso_handler_.get());
     }
 
     Session::~Session()
@@ -232,43 +221,70 @@ namespace YSH
     void Session::read_body(uint16_t len)
     {
         auto self = shared_from_this();
+        uint8_t body[MAX_LEN];
 
-        asio::async_read(socket_, asio::buffer(asio::buffer(body_, len)),
-                         [this, self, len](std::error_code ec, std::size_t length)
+        asio::async_read(socket_, asio::buffer(asio::buffer(body, len)),
+                         [this, self, body, len](std::error_code ec, std::size_t length)
                          {
                              if (ec)
                                  return;
-                             body_len_ = length;
-                             set_timeout(std::chrono::milliseconds(config_->timeout));
-                             asio::post(self->worker_pool_, [self, this]()
-                                        { self->handle_message(body_, body_len_); });
+
+                             // set_timeout(std::chrono::milliseconds(config_->timeout),body,len);
+                             auto state = std::make_shared<MessageTaskState>();
+
+                             state->timer = std::make_shared<asio::steady_timer>(io_context_, std::chrono::milliseconds(config_->timeout));
+
+                             state->timer->async_wait([state, self, body, len](const std::error_code &ec)
+                                                      {
+                                if (!ec && !state->is_completed) {
+                                    state->is_timed_out = true;
+                                    auto iso_timeout_msg=std::make_unique<IsoMsg>(self->iso_handler_);       
+
+                                    (void)DL_ISO8583_MSG_Unpack(iso_timeout_msg->getHandler(), body, len, iso_timeout_msg->get());
+                                    if(self->config_->timeout_processor) iso_timeout_msg = self->config_->timeout_processor(std::move(iso_timeout_msg));
+
+                                    DL_UINT8 packBuf[MAX_LEN];
+                                    DL_UINT16 packedSize;
+
+                                    (void)DL_ISO8583_MSG_Pack(iso_timeout_msg->getHandler(), iso_timeout_msg->get(), packBuf, &packedSize);
+
+                                    asio::post(self->strand_, [self , packBuf, packedSize]()
+                                            { 
+                                                self->send_response( packBuf, packedSize); 
+                                            });
+                                } });
+
+                             asio::post(self->worker_pool_, [self, state, body, length, this]()
+                                        { self->handle_message(state, body, length); });
+
+                             if (config_->is_persist_connection)
+                                 read_header();
                          });
     }
 
-    void Session::handle_message(const uint8_t *data, size_t len)
+    void Session::handle_message(std::shared_ptr<MessageTaskState> state, const uint8_t *data, size_t len)
     {
         auto self = shared_from_this();
-        DL_ISO8583_MSG iso_msg;
-        DL_ISO8583_MSG_Init(NULL, 0, &iso_msg);
-        (void)DL_ISO8583_MSG_Unpack(&iso_handler_, data, len, &iso_msg);
+        auto iso_msg = std::make_unique<IsoMsg>(iso_handler_);
+        (void)DL_ISO8583_MSG_Unpack(iso_msg->getHandler(), data, len, iso_msg->get());
 
-        config_->processor(iso_handler_, iso_msg);
+        if (config_->processor)
+            iso_msg = config_->processor(std::move(iso_msg));
+
+        if (state->is_timed_out)
         {
-            timer_.cancel();
-            std::lock_guard<std::mutex> lock(mtx_);
-            if (!timeout_flg_)
-            {
-                timeout_flg_ = true;
-                DL_UINT8 packBuf[MAX_LEN];
-                DL_UINT16 packedSize;
-
-                (void)DL_ISO8583_MSG_Pack(&iso_handler_, &iso_msg, packBuf, &packedSize);
-
-                asio::post(io_context_, [self = shared_from_this(), packBuf, packedSize]()
-                           { self->send_response(packBuf, packedSize); });
-            }
-            DL_ISO8583_MSG_Free(&iso_msg);
+            return;
         }
+        state->timer->cancel();
+        state->is_completed = true;
+
+        DL_UINT8 packBuf[MAX_LEN];
+        DL_UINT16 packedSize;
+
+        (void)DL_ISO8583_MSG_Pack(iso_msg->getHandler(), iso_msg->get(), packBuf, &packedSize);
+
+        asio::post(strand_, [self = shared_from_this(), packBuf, packedSize]()
+                   { self->send_response(packBuf, packedSize); });
     }
 
     void Session::send_response(const uint8_t *data, size_t len)
@@ -286,39 +302,7 @@ namespace YSH
                           {
                               if (ec)
                                   return;
-
-                              if (config_->is_persist_connection)
-                                  read_header();
                           });
-    }
-
-    void Session::set_timeout(std::chrono::milliseconds dur)
-    {
-        timeout_flg_ = false;
-        timer_.expires_after(dur);
-        timer_.async_wait([this, self = shared_from_this()](asio::error_code ec)
-                          {
-            if (!ec) 
-            {
-                std::lock_guard<std::mutex> lock(mtx_);
-                if(timeout_flg_) return;
-                timeout_flg_=true;
-                DL_ISO8583_MSG iso_timeout_msg;       
-                DL_ISO8583_MSG_Init(NULL, 0, &iso_timeout_msg);
-
-                (void)DL_ISO8583_MSG_Unpack(&iso_handler_, body_, body_len_, &iso_timeout_msg);
-                config_->timeout_processor(iso_handler_, iso_timeout_msg);
-
-                DL_UINT8 packBuf[MAX_LEN];
-                DL_UINT16 packedSize;
-
-                (void)DL_ISO8583_MSG_Pack(&iso_handler_, &iso_timeout_msg, packBuf, &packedSize);
-
-                asio::post(io_context_, [self = shared_from_this(), packBuf, packedSize]()
-                        { self->send_response(packBuf, packedSize); });
-
-                DL_ISO8583_MSG_Free(&iso_timeout_msg);
-            } });
     }
 
     // -------------------------
@@ -330,6 +314,11 @@ namespace YSH
     {
         acceptor_.listen(65535);
         do_accept();
+    }
+
+    Server::~Server()
+    {
+        io_.stop();
     }
 
     void Server::do_accept()
@@ -350,9 +339,11 @@ namespace YSH
     // -------------------------
 
     Client::Client(asio::io_context &io, std::shared_ptr<Config> config)
-        : io_(io), worker_pool_(config->worker_count), config_(config), workGuard_(asio::make_work_guard(io_)),
+        : io_(io), config_(config), workGuard_(asio::make_work_guard(io_)),
           stopped_(false)
     {
+        client_session_ = std::make_shared<ClientSession>(io_, config_);
+        client_session_->start();
     }
 
     Client::~Client()
@@ -382,8 +373,8 @@ namespace YSH
 
         asio::post(io_, [this, request = std::move(request)]() mutable
                    { 
-                    std::make_shared<ClientSession>(io_, worker_pool_, config_)->send_async(std::move(request));
-                });
+                    client_session_->send(std::move(request));
+                     });
     }
 
     // -------------------------
@@ -391,33 +382,31 @@ namespace YSH
     // -------------------------
     Processor::Processor()
     {
-
     }
     void Processor::stop()
     {
-
     }
-    void Processor::start(std::shared_ptr<Config> config,bool wait_flg)
+    void Processor::start(std::shared_ptr<Config> config, bool wait_flg)
     {
         config_ = config;
         try
         {
             if (config_->is_server)
             {
-                server_= std::make_unique<Server>(io_, config_);
+                server_ = std::make_unique<Server>(io_, config_);
             }
             else
             {
-                client_= std::make_unique<Client>(io_, config_);
+                client_ = std::make_unique<Client>(io_, config_);
             }
 
             threads_.reserve(config_->thread_count);
             for (int i = 0; i < config_->thread_count; ++i)
             {
                 threads_.emplace_back([&]()
-                                        { io_.run(); });
+                                      { io_.run(); });
             }
-            if(wait_flg)
+            if (wait_flg)
             {
                 for (auto &t : threads_)
                     t.join();
@@ -426,7 +415,7 @@ namespace YSH
             {
                 for (auto &t : threads_)
                     t.detach();
-            }           
+            }
         }
         catch (const std::exception &e)
         {
@@ -436,6 +425,7 @@ namespace YSH
 
     void Processor::send(std::unique_ptr<IsoMsg> request)
     {
-        if(client_) client_->send(std::move(request));
+        if (client_)
+            client_->send(std::move(request));
     }
 }
