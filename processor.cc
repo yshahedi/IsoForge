@@ -33,21 +33,24 @@ namespace YSH
     void ClientSession::send(std::unique_ptr<IsoMsg> request)
     {
         auto self = shared_from_this();
-        DL_UINT16 length;
-        uint8_t body[MAX_LEN];
-        (void)DL_ISO8583_MSG_Pack(request->getHandler(), request->get(), body, &length);
+       
 
         auto state = std::make_shared<MessageTaskState>();
 
         state->timer = std::make_shared<asio::steady_timer>(io_context_, std::chrono::milliseconds(config_->timeout));
+        
+        auto packBuf=std::make_unique<DL_UINT8[]>(MAX_LEN);
+	    DL_UINT16          packedSize;
+        (void)DL_ISO8583_MSG_Pack(request->getHandler(),request->get(),packBuf.get(),&packedSize);        
 
-        state->timer->async_wait([state, self, body, length](const std::error_code &ec)
+        state->timer->async_wait([state, self, packBuf=std::move(packBuf),packedSize](const std::error_code &ec) mutable
                                  {
+        auto iso_timeout_msg=std::make_unique<IsoMsg>(self->iso_handler_);       
+
+        (void)DL_ISO8583_MSG_Unpack(iso_timeout_msg->getHandler(), packBuf.get(), packedSize, iso_timeout_msg->get());
         if (!ec && !state->is_completed) {
             state->is_timed_out = true;
-            auto iso_timeout_msg=std::make_unique<IsoMsg>(self->iso_handler_);       
-
-            (void)DL_ISO8583_MSG_Unpack(iso_timeout_msg->getHandler(), body, length, iso_timeout_msg->get());
+            
             if(self->config_->timeout_processor) iso_timeout_msg = self->config_->timeout_processor(std::move(iso_timeout_msg));
 
             asio::post(self->strand_, [self , iso_timeout_msg = std::move(iso_timeout_msg)]() mutable
@@ -56,10 +59,10 @@ namespace YSH
             });
         } });
         auto stan =getStan(request->get());
-        
+
         message_state_->emplace(stan, state);
 
-        do_write(body, length);
+        do_write(std::move(request));
     }
 
     void ClientSession::finish(asio::error_code ec, std::unique_ptr<IsoMsg> response)
@@ -92,8 +95,11 @@ namespace YSH
             });
     }
 
-    void ClientSession::do_write(const uint8_t *data, size_t len)
+    void ClientSession::do_write(std::unique_ptr<IsoMsg> iso_msg)
     {
+         DL_UINT16 len;
+        uint8_t body[MAX_LEN];
+        (void)DL_ISO8583_MSG_Pack(iso_msg->getHandler(), iso_msg->get(), body, &len);
 
         auto self = shared_from_this();
         uint8_t hdr[2];
@@ -102,7 +108,7 @@ namespace YSH
 
         std::array<asio::const_buffer, 2> buffers = {
             asio::buffer(hdr, 2),
-            asio::buffer(data, len)};
+            asio::buffer(body, len)};
         asio::async_write(socket_, buffers,
                           [this, self, len](std::error_code ec, std::size_t)
                           {
@@ -221,52 +227,52 @@ namespace YSH
     void Session::read_body(uint16_t len)
     {
         auto self = shared_from_this();
-        uint8_t body[MAX_LEN];
+        auto body = std::make_shared<uint8_t[]>(len);
 
-        asio::async_read(socket_, asio::buffer(asio::buffer(body, len)),
-                         [this, self, body, len](std::error_code ec, std::size_t length)
+
+        asio::async_read(socket_, asio::buffer(asio::buffer(body.get(), len)),
+                         [this, self, body](std::error_code ec, std::size_t length)
                          {
                              if (ec)
                                  return;
-
+                             
                              // set_timeout(std::chrono::milliseconds(config_->timeout),body,len);
                              auto state = std::make_shared<MessageTaskState>();
 
                              state->timer = std::make_shared<asio::steady_timer>(io_context_, std::chrono::milliseconds(config_->timeout));
 
-                             state->timer->async_wait([state, self, body, len](const std::error_code &ec)
+                             state->timer->async_wait([state, self, body, length](const std::error_code &ec)
                                                       {
                                 if (!ec && !state->is_completed) {
                                     state->is_timed_out = true;
                                     auto iso_timeout_msg=std::make_unique<IsoMsg>(self->iso_handler_);       
 
-                                    (void)DL_ISO8583_MSG_Unpack(iso_timeout_msg->getHandler(), body, len, iso_timeout_msg->get());
+                                    (void)DL_ISO8583_MSG_Unpack(iso_timeout_msg->getHandler(), body.get(), length, iso_timeout_msg->get());
                                     if(self->config_->timeout_processor) iso_timeout_msg = self->config_->timeout_processor(std::move(iso_timeout_msg));
 
-                                    DL_UINT8 packBuf[MAX_LEN];
-                                    DL_UINT16 packedSize;
 
-                                    (void)DL_ISO8583_MSG_Pack(iso_timeout_msg->getHandler(), iso_timeout_msg->get(), packBuf, &packedSize);
-
-                                    asio::post(self->strand_, [self , packBuf, packedSize]()
+                                    asio::post(self->strand_, [self ,iso_timeout_msg=std::move(iso_timeout_msg)]() mutable
                                             { 
-                                                self->send_response( packBuf, packedSize); 
+                                                self->send_response( std::move(iso_timeout_msg)); 
                                             });
                                 } });
 
-                             asio::post(self->worker_pool_, [self, state, body, length, this]()
-                                        { self->handle_message(state, body, length); });
+                             auto iso_msg = std::make_unique<IsoMsg>(iso_handler_);
+                            (void)DL_ISO8583_MSG_Unpack(iso_msg->getHandler(), body.get(), length, iso_msg->get());
+                             asio::post(self->worker_pool_, [self, state, iso_msg=std::move(iso_msg), this]() mutable
+                                        { 
+                                            self->handle_message(state, std::move(iso_msg)); 
+                                        });
 
                              if (config_->is_persist_connection)
                                  read_header();
                          });
     }
 
-    void Session::handle_message(std::shared_ptr<MessageTaskState> state, const uint8_t *data, size_t len)
+    void Session::handle_message(std::shared_ptr<MessageTaskState> state, std::unique_ptr<IsoMsg> iso_msg)
     {
         auto self = shared_from_this();
-        auto iso_msg = std::make_unique<IsoMsg>(iso_handler_);
-        (void)DL_ISO8583_MSG_Unpack(iso_msg->getHandler(), data, len, iso_msg->get());
+        
 
         if (config_->processor)
             iso_msg = config_->processor(std::move(iso_msg));
@@ -278,27 +284,29 @@ namespace YSH
         state->timer->cancel();
         state->is_completed = true;
 
+       
+
+        asio::post(strand_, [self = shared_from_this(), iso_msg=std::move(iso_msg)]() mutable
+                   { self->send_response(std::move(iso_msg)); });
+    }
+
+    void Session::send_response(std::unique_ptr<IsoMsg> iso_msg)
+    {
+        auto self = shared_from_this();
         DL_UINT8 packBuf[MAX_LEN];
         DL_UINT16 packedSize;
 
         (void)DL_ISO8583_MSG_Pack(iso_msg->getHandler(), iso_msg->get(), packBuf, &packedSize);
 
-        asio::post(strand_, [self = shared_from_this(), packBuf, packedSize]()
-                   { self->send_response(packBuf, packedSize); });
-    }
-
-    void Session::send_response(const uint8_t *data, size_t len)
-    {
-        auto self = shared_from_this();
         uint8_t hdr[2];
-        hdr[0] = static_cast<uint8_t>((len >> 8) & 0xFF);
-        hdr[1] = static_cast<uint8_t>(len & 0xFF);
+        hdr[0] = static_cast<uint8_t>((packedSize >> 8) & 0xFF);
+        hdr[1] = static_cast<uint8_t>(packedSize & 0xFF);
 
         std::array<asio::const_buffer, 2> buffers = {
             asio::buffer(hdr, 2),
-            asio::buffer(data, len)};
+            asio::buffer(packBuf, packedSize)};
         asio::async_write(socket_, buffers,
-                          [this, self, data, len](std::error_code ec, std::size_t)
+                          [this, self](std::error_code ec, std::size_t)
                           {
                               if (ec)
                                   return;

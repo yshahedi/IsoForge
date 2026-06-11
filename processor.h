@@ -123,7 +123,7 @@ namespace YSH
 
     private:
         void do_connect(const tcp::resolver::results_type &endpoints);
-        void do_write(const uint8_t *data, size_t len);
+        void do_write(std::unique_ptr<IsoMsg> iso_msg);
         void read_header();
         void read_body(uint16_t len);
 
@@ -134,7 +134,7 @@ namespace YSH
 
         std::shared_ptr<DL_ISO8583_HANDLER> iso_handler_;
 
-        sf::safe_ptr<std::map<uint32_t, std::shared_ptr<MessageTaskState>>> message_state_;
+        inline static sf::safe_ptr<std::map<uint32_t, std::shared_ptr<MessageTaskState>>> message_state_;
 
         uint8_t header_[2];
         uint8_t body_[MAX_LEN];
@@ -159,8 +159,8 @@ namespace YSH
     private:
         void read_header();
         void read_body(uint16_t len);
-        void handle_message(std::shared_ptr<MessageTaskState> state,const uint8_t *data, size_t len);
-        void send_response(const uint8_t *data, size_t len);
+        void handle_message(std::shared_ptr<MessageTaskState> state,std::unique_ptr<IsoMsg> iso_msg);
+        void send_response(std::unique_ptr<IsoMsg> iso_msg);
 
         tcp::socket socket_;
 
