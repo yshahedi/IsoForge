@@ -134,13 +134,11 @@ namespace YSH
 
         std::shared_ptr<DL_ISO8583_HANDLER> iso_handler_;
 
-        inline static sf::safe_ptr<std::map<uint32_t, std::shared_ptr<MessageTaskState>>> message_state_;
+        sf::safe_ptr<std::map<uint32_t, std::shared_ptr<MessageTaskState>>> message_state_;
 
-        uint8_t header_[2];
-        uint8_t body_[MAX_LEN];
-        uint16_t body_len_;
         std::shared_ptr<Config> config_;
         bool timeout_flg_;
+        std::mutex mutex;
     };
 
     // -------------------------

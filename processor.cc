@@ -25,6 +25,7 @@ namespace YSH
 
     void ClientSession::start()
     {
+        std::cout << "START..." << std::endl;
         tcp::resolver resolver(io_context_);
         auto endpoints = resolver.resolve(config_->host, std::to_string(config_->port));
         do_connect(endpoints);
@@ -59,10 +60,16 @@ namespace YSH
             });
         } });
         auto stan =getStan(request->get());
-
+        //std::cout << "Emplace Stan:" << stan << std::endl;
         message_state_->emplace(stan, state);
 
-        do_write(std::move(request));
+        asio::post(self->strand_, [self , request = std::move(request)]() mutable
+            { 
+                self->do_write(std::move(request));
+            }); 
+
+           // do_write(std::move(request));
+        
     }
 
     void ClientSession::finish(asio::error_code ec, std::unique_ptr<IsoMsg> response)
@@ -109,7 +116,7 @@ namespace YSH
         std::array<asio::const_buffer, 2> buffers = {
             asio::buffer(hdr, 2),
             asio::buffer(body, len)};
-        asio::async_write(socket_, buffers,
+       /* asio::async_write(socket_, buffers,
                           [this, self, len](std::error_code ec, std::size_t)
                           {
                               if (ec)
@@ -117,22 +124,37 @@ namespace YSH
                                   self->finish(ec, nullptr);
                                   return;
                               }
-                          });
+                          });*/
+            asio::async_write(socket_, buffers,
+                asio::bind_executor(strand_,
+                    [](std::error_code ec, std::size_t n) {
+                        
+                    }));
+        
     }
 
     void ClientSession::read_header()
     {
         auto self = shared_from_this();
-        asio::async_read(socket_, asio::buffer(header_, 2),
-                         [this, self](std::error_code ec, std::size_t)
+        auto header = std::make_shared<uint8_t[]>(2);
+
+        asio::async_read(socket_, asio::buffer(header.get(), 2),
+                         [this, header,self](std::error_code ec, std::size_t) 
                          {
+                            if (ec == asio::error::connection_reset)
+                            {
+                                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+                                self->start();
+                                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                            }
                              if (ec)
                              {
+                                
                                  self->finish(ec, nullptr);
                                  return;
                              }
 
-                             uint16_t len = (static_cast<uint16_t>(header_[0]) << 8) | header_[1];
+                             uint16_t len = (static_cast<uint16_t>(header.get()[0]) << 8) | header.get()[1];
                              if (len == 0 || len > MAX_LEN)
                              {
                                  return;
@@ -145,9 +167,10 @@ namespace YSH
     void ClientSession::read_body(uint16_t len)
     {
         auto self = shared_from_this();
+        auto body = std::make_shared<uint8_t[]>(len);
 
-        asio::async_read(socket_, asio::buffer(asio::buffer(body_, len)),
-                         [this, self, len](std::error_code ec, std::size_t length)
+        asio::async_read(socket_, asio::buffer(asio::buffer(body.get(), len)),
+                         [this, self, body, len](std::error_code ec, std::size_t length)
                          {
                              if (ec)
                              {
@@ -156,22 +179,37 @@ namespace YSH
                              else
                              {
                                  auto iso_msg = std::make_unique<IsoMsg>(iso_handler_);
-                                 (void)DL_ISO8583_MSG_Unpack(iso_msg->getHandler(), body_, length, iso_msg->get());
+                                 (void)DL_ISO8583_MSG_Unpack(iso_msg->getHandler(), body.get(), length, iso_msg->get());
                                  auto stan = getStan(iso_msg->get());
+                                // std::cout << "get STAN:" << stan << std::endl;
                                  auto it = message_state_->find(stan);
                                  if (it == message_state_->end())
                                  {
+                                     std::cout << "Stan not found:" << stan << std::endl;
                                      self->read_header();
                                      return;
                                  }
+                                
                                  if (it->second->is_timed_out)
                                  {
-                                     message_state_->erase(it);
-                                     self->read_header();
-                                     return;
+                                    if (it->second->timer)
+                                    {
+                                        std::error_code ignored;
+                                        it->second->timer->cancel(ignored);
+                                    }
+                                    it->second.reset();
+                                    message_state_->erase(it);
+                                    self->read_header();
+                                    return;
                                  }
                                  it->second->timer->cancel();
                                  it->second->is_completed = true;
+                                 if (it->second->timer)
+                                 {
+                                     std::error_code ignored;
+                                     it->second->timer->cancel(ignored);
+                                 }
+                                 it->second.reset();
                                  message_state_->erase(it);
                                  self->finish({}, std::move(iso_msg));
                              }
